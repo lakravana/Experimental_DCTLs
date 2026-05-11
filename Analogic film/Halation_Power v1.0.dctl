@@ -1,0 +1,161 @@
+//Halation_Power / version 1.0 / Analogical Halation Emulation
+//Created by Galavnikov @ lakravana.com
+
+
+// Checkbox Enable
+DEFINE_UI_PARAMS(p_Enable, Enable Halation, DCTLUI_CHECK_BOX, 1)
+
+// Highlight Selection
+#define SIG 0
+#define LOG 1
+
+// Highlight Selection
+DEFINE_UI_PARAMS(p_Midpoint, Highlight Midpoint, DCTLUI_SLIDER_FLOAT, 0.8, 0.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(p_Contrast, LOG intensity, DCTLUI_SLIDER_FLOAT, 5.0, 1.0, 100.0, 0.1)
+DEFINE_UI_PARAMS(p_SigmoidStr, SIGMO Strength, DCTLUI_SLIDER_FLOAT, 1.0, 0.1, 5.0, 0.1)
+DEFINE_UI_PARAMS(p_CurveType, Contrast Curve, DCTLUI_COMBO_BOX, 1, {SIG, LOG}, {SIGMO, LOG})
+
+
+// Halation Blur
+DEFINE_UI_PARAMS(p_Blur, Blur Radius, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 50.0, 0.1)
+
+// Halation Color
+DEFINE_UI_PARAMS(p_Hue, Halation Hue, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 360.0, 1.0) // 0 = Red
+DEFINE_UI_PARAMS(p_Intensity, Halation Intensity, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 5.0, 0.01)
+
+__DEVICE__ float3 hsv_to_rgb(float h, float s, float v) {
+    float c = v * s;
+    float x = c * (1.0f - _fabs(fmod(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+
+    float3 rgb;
+
+    if (h >= 0.0f && h < 60.0f) {
+        rgb = make_float3(c, x, 0.0f);
+    } else if (h >= 60.0f && h < 120.0f) {
+        rgb = make_float3(x, c, 0.0f);
+    } else if (h >= 120.0f && h < 180.0f) {
+        rgb = make_float3(0.0f, c, x);
+    } else if (h >= 180.0f && h < 240.0f) {
+        rgb = make_float3(0.0f, x, c);
+    } else if (h >= 240.0f && h < 300.0f) {
+        rgb = make_float3(x, 0.0f, c);
+    } else {
+        rgb = make_float3(c, 0.0f, x);
+    }
+
+    return rgb + m;
+}
+
+// Function to calculate luminance (Rec 709)
+__DEVICE__ float get_luma(float3 rgb) {
+    return dot(rgb, make_float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// Highlight Mask Calculation Function
+__DEVICE__ float calculate_mask(float luma, float midpoint, float contrast, float sigmoid_str, int curve_type) {
+    float mask = 0.0f;
+    float m = midpoint;
+
+    if (curve_type == 0) {
+        // Sigmoid (S-Curve)
+        // Decoupled: Sigmoid Strength * 5.0 (Base K)
+        float k = sigmoid_str * 5.0f;
+        mask = 1.0f / (1.0f + _expf(-k * (luma - m) * 10.0f)); 
+    } else {
+        // Logarithmic
+        if (luma > m) {
+             float x = luma - m;
+             float max_x = 1.0f - m; 
+             if (max_x > 0.0001f) {
+                float norm_x = x / max_x; 
+                float C = contrast * 10.0f; 
+                mask = _logf(norm_x * C + 1.0f) / _logf(C + 1.0f);
+             } else {
+                mask = 1.0f;
+             }
+        } else {
+            mask = 0.0f;
+        }
+    }
+    // Clamp mask
+    return _fminf(_fmaxf(mask, 0.0f), 1.0f);
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB)
+{
+    float p_R = _tex2D(p_TexR, p_X, p_Y);
+    float p_G = _tex2D(p_TexG, p_X, p_Y);
+    float p_B = _tex2D(p_TexB, p_X, p_Y);
+
+    float3 in_rgb = make_float3(p_R, p_G, p_B);
+    
+    // Checkbox Enable
+    if (p_Enable == 0) return in_rgb;
+
+    // Blur Sampling Logic
+    // Gaussian Blur Logic
+    float accumulated_mask = 0.0f;
+    float total_weight = 0.0f;
+    float radius = p_Blur;
+    
+    // Optimization: If radius is small, just sample center
+    if (radius <= 0.1f) {
+        float luma = get_luma(in_rgb);
+        accumulated_mask = calculate_mask(luma, p_Midpoint, p_Contrast, p_SigmoidStr, p_CurveType);
+        total_weight = 1.0f;
+    } else {
+        // Sigma for Gaussian.
+        // Rule of thumb: radius covers ~ 2-3 sigmas.
+        // Let's say radius = 2 * sigma -> sigma = radius / 2.0
+        float sigma = radius / 2.0f;
+        float two_sigma_sq = 2.0f * sigma * sigma;
+        
+        // Determine sampling window
+        // 3 sigma is usually enough for "complete" gaussian, but we can clamp to radius for performance
+        // if the user intends "radius" to be the cutoff.
+        int steps = (int)_ceilf(radius);
+        
+        // Safety cap for performance to prevent GPU timeouts on large radii
+        if (steps > 25) steps = 25; 
+        
+        for (int i = -steps; i <= steps; ++i) {
+            for (int j = -steps; j <= steps; ++j) {
+                float offset_x = (float)i; // 1 pixel steps
+                float offset_y = (float)j;
+                
+                // Calculate distance squared
+                float dist_sq = offset_x * offset_x + offset_y * offset_y;
+                
+                // Calculate Gaussian Weight: exp(-d^2 / 2sigma^2)
+                float weight = _expf(-dist_sq / two_sigma_sq);
+                
+                // Read Neighbor
+                // Note: p_X and p_Y are pixels, offset_x/y are pixels
+                float samp_r = _tex2D(p_TexR, p_X + offset_x, p_Y + offset_y);
+                float samp_g = _tex2D(p_TexG, p_X + offset_x, p_Y + offset_y);
+                float samp_b = _tex2D(p_TexB, p_X + offset_x, p_Y + offset_y);
+                float3 samp_rgb = make_float3(samp_r, samp_g, samp_b);
+                
+                float luma = get_luma(samp_rgb);
+                
+                accumulated_mask += calculate_mask(luma, p_Midpoint, p_Contrast, p_SigmoidStr, p_CurveType) * weight;
+                total_weight += weight;
+            }
+        }
+    }
+    
+    float final_mask = 0.0f;
+    if (total_weight > 0.0f) {
+        final_mask = accumulated_mask / total_weight;
+    }
+    
+    // 3. Generate Base Halation Color (from Hue Slider)
+    float3 base_color = hsv_to_rgb(p_Hue, 1.0f, 1.0f);
+
+    // 4. Apply Halation Intensity (Multiplier)
+    float3 halation_signal = base_color * final_mask * p_Intensity;
+
+    // 5. Add to Original
+    return in_rgb + halation_signal;
+}
